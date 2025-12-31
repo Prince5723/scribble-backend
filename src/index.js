@@ -11,6 +11,12 @@ const http = require('http');
 const { Server } = require('socket.io');
 const playerManager = require('./players');
 const roomManager = require('./rooms');
+const gameEngine = require('./gameEngine');
+const wordEngine = require('./wordEngine');
+const timerEngine = require('./timerEngine');
+const drawingEngine = require('./drawingEngine');
+const guessEngine = require('./guessEngine');
+const scoreEngine = require('./scoreEngine');
 
 // =============================================================================
 // CONFIGURATION
@@ -30,6 +36,8 @@ const app = express();
 // Create HTTP server using Node's built-in http module
 // We use http.createServer() instead of app.listen() to allow Socket.IO attachment
 const server = http.createServer(app);
+
+app.use(express.static('../frontend'));
 
 // =============================================================================
 // SOCKET.IO CONFIGURATION
@@ -66,6 +74,66 @@ function broadcastRoomUpdate(roomId) {
       io.to(player.socketId).emit('room_updated', { room: serialized });
     }
   });
+}
+
+/**
+ * Broadcast settings update to all players in a room
+ * @param {string} roomId - Room ID to broadcast to
+ * @param {Object} settings - Updated settings object
+ */
+function broadcastSettingsUpdate(roomId, settings) {
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+
+  // Emit to all players in the room
+  room.players.forEach(playerId => {
+    const player = playerManager.getPlayerById(playerId);
+    if (player && player.socketId) {
+      io.to(player.socketId).emit('room_settings_updated', { settings });
+    }
+  });
+}
+
+/**
+ * Broadcast game state to all players in a room
+ * @param {string} roomId - Room ID to broadcast to
+ * @param {string} eventName - Event name to emit
+ * @param {Object} payload - Event payload
+ */
+function broadcastToRoom(roomId, eventName, payload) {
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+
+  // Emit to all players in the room
+  room.players.forEach(playerId => {
+    const player = playerManager.getPlayerById(playerId);
+    if (player && player.socketId) {
+      io.to(player.socketId).emit(eventName, payload);
+    }
+  });
+}
+
+/**
+ * Serialize game state for client (never includes selectedWord)
+ * @param {Object} room - Room object with game
+ * @returns {Object|null} Serialized game state or null
+ */
+function serializeGameState(room) {
+  if (!room.game) {
+    return null;
+  }
+
+  const game = room.game;
+  return {
+    phase: game.phase,
+    currentRound: game.currentRound,
+    totalRounds: game.totalRounds,
+    drawerId: game.drawerId,
+    drawerIndex: game.drawerIndex,
+    guessedPlayers: game.guessedPlayers || [],
+    maskedWord: game.maskedWord || null
+    // selectedWord is intentionally excluded - server-only
+  };
 }
 
 // =============================================================================
@@ -247,6 +315,660 @@ io.on('connection', (socket) => {
         socket.emit('room_left', { roomId: roomId });
         broadcastRoomUpdate(roomId);
       }
+    }
+  });
+
+  // =============================================================================
+  // ROOM SETTINGS UPDATE HANDLER
+  // =============================================================================
+
+  socket.on('update_room_settings', (payload) => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player) {
+      socket.emit('room_settings_error', { message: 'Player not found' });
+      return;
+    }
+
+    // Check if player is in a room
+    if (!player.roomId) {
+      socket.emit('room_settings_error', { message: 'Not in a room' });
+      return;
+    }
+
+    // Validate payload structure
+    if (!payload || typeof payload !== 'object' || !payload.settings) {
+      socket.emit('room_settings_error', { message: 'Invalid settings payload' });
+      return;
+    }
+
+    const { settings } = payload;
+
+    // Update room settings
+    const result = roomManager.updateRoomSettings(player.id, player.roomId, settings);
+
+    if (result.success) {
+      // Broadcast settings update to all players in room
+      broadcastSettingsUpdate(player.roomId, result.settings);
+    } else {
+      // Send error back to requesting client
+      socket.emit('room_settings_error', { message: result.error });
+    }
+  });
+
+  // =============================================================================
+  // GAME START HANDLER
+  // =============================================================================
+
+  socket.on('start_game', () => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player) {
+      socket.emit('game_error', { error: 'Player not found' });
+      return;
+    }
+
+    // Check if player is in a room
+    if (!player.roomId) {
+      socket.emit('game_error', { error: 'Not in a room' });
+      return;
+    }
+
+    // Get room
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      socket.emit('game_error', { error: 'Room not found' });
+      return;
+    }
+
+    console.log(`[SOCKET] start_game from socket ${socket.id}`);
+    // Start game
+    const result = gameEngine.startGame(room, player.id);
+
+    if (result.success) {
+      // Reset player scores for new game
+      playerManager.resetPlayerScores(room.players);
+
+      // Serialize latest room state (status will now be "in_game")
+      const serializedRoom = roomManager.serializeRoom(
+        room,
+        playerManager.getPlayerById
+      );
+
+      console.log(`[GAME] Emitting game_started | room=${room.id} | drawer=${room.game.drawerId}`);
+      // Broadcast game started with both game + room so clients stay in sync
+      broadcastToRoom(room.id, 'game_started', {
+        game: serializeGameState(room),
+        room: serializedRoom,
+        players: serializedRoom.players
+      });
+      
+      // Start first round
+      startRoundForRoom(room);
+    } else {
+      // Send error back to requesting client
+      socket.emit('game_error', { error: result.error });
+    }
+  });
+
+  // =============================================================================
+  // WORD SELECTION HANDLERS (MODULE 6)
+  // =============================================================================
+
+  /**
+   * Start round and handle word selection
+   * Called when game starts or round progresses
+   */
+  function startRoundForRoom(room) {
+    const result = gameEngine.startRound(room);
+    if (!result.success) {
+      console.error(`[GAME] Failed to start round: ${room.id} | Error: ${result.error}`);
+      return;
+    }
+
+    // Initialize round start time for scoring
+    const roundStartTime = Date.now();
+    scoreEngine.initializeRoundStartTime(room, roundStartTime);
+    room.game.roundStartTime = roundStartTime; // Store for scoring calculations
+
+    console.log(`[GAME] Round start | room=${room.id} | round=${room.game.currentRound} | drawer=${room.game.drawerId}`);
+    // Generate word options for drawer
+    const wordOptionsResult = wordEngine.generateOptionsForDrawer(room);
+    if (!wordOptionsResult.success) {
+      console.error(`[WORD] Failed to generate options: ${room.id} | Error: ${wordOptionsResult.error}`);
+      return;
+    }
+
+    const drawerId = room.game.drawerId;
+    const drawer = playerManager.getPlayerById(drawerId);
+    
+    // Send word options to drawer only
+    if (drawer && drawer.socketId) {
+      console.log(
+        `[WORD] Emitting word_options to drawer socket=${drawer.socketId} | room=${room.id} | options=${JSON.stringify(
+          wordOptionsResult.options
+        )}`
+      );
+      io.to(drawer.socketId).emit('word_options', {
+        options: wordOptionsResult.options,
+        timeout: wordEngine.WORD_SELECTION_TIMEOUT
+      });
+    }
+
+    // Broadcast round start to all players
+    console.log(`[GAME] Emitting round_started to room=${room.id}`);
+    broadcastToRoom(room.id, 'round_started', {
+      game: serializeGameState(room),
+      drawerId: drawerId
+    });
+
+    // Start word selection timer
+    timerEngine.startWordSelectionTimer(
+      room,
+      (roomId, remaining) => {
+        // Timer tick - broadcast to room
+        broadcastToRoom(roomId, 'timer_tick', {
+          remaining: remaining,
+          type: 'word_selection'
+        });
+      },
+      (roomId) => {
+        // Timer timeout - auto-select word
+        const room = roomManager.getRoom(roomId);
+        if (!room) return;
+
+        const autoSelectResult = wordEngine.autoSelectWord(room);
+        if (autoSelectResult.success) {
+          // Broadcast word selected
+          broadcastToRoom(roomId, 'word_selected', {
+            maskedWord: autoSelectResult.maskedWord,
+            autoSelected: true
+          });
+
+          // Start drawing phase
+          startDrawingPhase(room);
+        }
+      }
+    );
+  }
+
+  /**
+   * Handle word selection from drawer
+   */
+  socket.on('select_word', (payload) => {
+    console.log(`[SOCKET] select_word from socket ${socket.id} payload=${JSON.stringify(payload)}`);
+    const player = playerManager.getPlayer(socket.id);
+    if (!player) {
+      socket.emit('game_error', { error: 'Player not found' });
+      return;
+    }
+
+    if (!player.roomId) {
+      socket.emit('game_error', { error: 'Not in a room' });
+      return;
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      socket.emit('game_error', { error: 'Room not found' });
+      return;
+    }
+
+    // Validate payload
+    if (!payload || typeof payload !== 'object' || !payload.word) {
+      socket.emit('game_error', { error: 'Invalid word selection' });
+      return;
+    }
+
+    const { word } = payload;
+
+    // Select word
+    const result = wordEngine.selectWord(room, player.id, word);
+    if (result.success) {
+      // Stop word selection timer
+      timerEngine.stopTimer(room.id);
+
+      console.log(
+        `[WORD] Emitting word_selected | room=${room.id} | maskedWord=${result.maskedWord}`
+      );
+      // Broadcast word selected to room
+      broadcastToRoom(room.id, 'word_selected', {
+        maskedWord: result.maskedWord,
+        autoSelected: false
+      });
+
+      // Start drawing phase
+      startDrawingPhase(room);
+    } else {
+      socket.emit('game_error', { error: result.error });
+    }
+  });
+
+  /**
+   * Start drawing phase
+   */
+  function startDrawingPhase(room) {
+    // Initialize round start time if missing
+    if (!room.game.roundStartTime) {
+      scoreEngine.initializeRoundStartTime(room, Date.now());
+    }
+  
+    // Clear drawing state
+    drawingEngine.clearDrawingState(room.id);
+  
+    const maskedWord = wordEngine.getMaskedWord(room);
+    const drawerId = room.game.drawerId;
+  
+    console.log(
+      `[DRAW] Starting drawing phase | room=${room.id} | drawer=${drawerId} | maskedWord=${maskedWord}`
+    );
+  
+    // Broadcast drawing phase started
+    room.players.forEach(playerId => {
+      const player = playerManager.getPlayerById(playerId);
+      if (!player || !player.socketId) return;
+  
+      if (playerId === drawerId) {
+        io.to(player.socketId).emit('drawing_started', {
+          game: serializeGameState(room),
+          drawerId: drawerId,
+          word: wordEngine.getSelectedWord(room)
+        });
+      } else {
+        io.to(player.socketId).emit('drawing_started', {
+          game: serializeGameState(room),
+          drawerId: drawerId,
+          maskedWord: maskedWord
+        });
+      }
+    });
+  
+    // Start drawing timer
+    timerEngine.startDrawingTimer(
+      room,
+      (roomId, remaining) => {
+        broadcastToRoom(roomId, 'timer_tick', {
+          remaining: remaining,
+          type: 'drawing'
+        });
+      },
+      (roomId) => {
+        const room = roomManager.getRoom(roomId);
+        if (!room) return;
+        endRoundForRoom(room);
+      }
+    );
+  }
+  
+
+  /**
+   * End round and handle scoring
+   */
+  function endRoundForRoom(room) {
+    // Stop drawing timer
+    timerEngine.stopTimer(room.id);
+
+    // Award drawer score
+    scoreEngine.awardDrawerScore(
+      room,
+      playerManager.getPlayerById,
+      playerManager.updatePlayerScore
+    );
+
+    // End round
+    const result = gameEngine.endRound(room);
+    if (!result.success) {
+      console.error(`[GAME] Failed to end round: ${room.id} | Error: ${result.error}`);
+      return;
+    }
+
+    // Get leaderboard
+    const leaderboard = scoreEngine.getLeaderboard(room, playerManager.getPlayerById);
+
+    const isLastDrawer = gameEngine.drawerIndex === room.players.length - 1;
+
+    // Broadcast round end (reveal word to all)
+    broadcastToRoom(room.id, 'round_ended', {
+      game: serializeGameState(room),
+      leaderboard: leaderboard,
+      selectedWord: wordEngine.getSelectedWord(room), // Reveal word at end of round
+      roundCompleted: isLastDrawer,
+    });
+
+    // Clear word selection and drawing state
+    wordEngine.clearWordSelection(room);
+    drawingEngine.clearDrawingState(room.id);
+    scoreEngine.clearRoundScoring(room.id);
+
+    // Check if game should end
+    if (result.gameEnded) {
+      // End game
+      endGameForRoom(room);
+    } else {
+      // Progress to next drawer
+      setTimeout(() => {
+        progressToNextDrawer(room);
+      }, 3000); // 3 second delay before next round
+    }
+  }
+
+  /**
+   * Progress to next drawer
+   */
+  function progressToNextDrawer(room) {
+    const result = gameEngine.progressToNextDrawer(room);
+    if (result.success) {
+      // Start new round
+      startRoundForRoom(room);
+    } else {
+      console.error(`[GAME] Failed to progress drawer: ${room.id} | Error: ${result.error}`);
+    }
+  }
+
+  /**
+   * End game and show final results
+   */
+  function endGameForRoom(room) {
+    // Stop any active timers
+    timerEngine.stopTimer(room.id);
+
+    // End game
+    const result = gameEngine.endGame(room);
+    if (!result.success) {
+      console.error(`[GAME] Failed to end game: ${room.id} | Error: ${result.error}`);
+      return;
+    }
+
+    // Get final leaderboard
+    const leaderboard = scoreEngine.getLeaderboard(room, playerManager.getPlayerById);
+
+    // Broadcast game ended
+    broadcastToRoom(room.id, 'game_ended', {
+      roundsPlayed: result.roundsPlayed,
+      leaderboard: leaderboard
+    });
+
+    // Clear game state
+    wordEngine.clearWordSelection(room);
+    drawingEngine.clearDrawingState(room.id);
+    scoreEngine.clearRoundScoring(room.id);
+  }
+
+  // =============================================================================
+  // DRAWING HANDLERS (MODULE 8)
+  // =============================================================================
+
+  socket.on('draw_start', (payload) => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player || !player.roomId) {
+      socket.emit('game_error', { error: 'Not in a room' });
+      return;
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      socket.emit('game_error', { error: 'Room not found' });
+      return;
+    }
+
+    const result = drawingEngine.handleDrawStart(room, player.id, payload);
+    if (result.success) {
+      // Broadcast to guessers only (not drawer)
+      const drawerId = room.game.drawerId;
+      room.players.forEach(playerId => {
+        if (playerId !== drawerId) {
+          const guesser = playerManager.getPlayerById(playerId);
+          if (guesser && guesser.socketId) {
+            io.to(guesser.socketId).emit('draw_start', result.data);
+          }
+        }
+      });
+    } else {
+      socket.emit('game_error', { error: result.error });
+    }
+  });
+
+  socket.on('draw_move', (payload) => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player || !player.roomId) {
+      return; // Silently ignore if not in room
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      return;
+    }
+
+    const result = drawingEngine.handleDrawMove(room, player.id, payload);
+    if (result.success) {
+      if (result.shouldBatch) {
+        // Event was batched, will be sent when batch is flushed
+        // Flush batch periodically (every 50ms)
+        setTimeout(() => {
+          const batch = drawingEngine.flushBatch(room.id);
+          if (batch && batch.length > 0) {
+            const drawerId = room.game.drawerId;
+            room.players.forEach(playerId => {
+              if (playerId !== drawerId) {
+                const guesser = playerManager.getPlayerById(playerId);
+                if (guesser && guesser.socketId) {
+                  io.to(guesser.socketId).emit('draw_move', batch);
+                }
+              }
+            });
+          }
+        }, drawingEngine.BATCH_WINDOW_MS);
+        return;
+      }
+
+      // Broadcast to guessers only (not drawer)
+      const drawerId = room.game.drawerId;
+      room.players.forEach(playerId => {
+        if (playerId !== drawerId) {
+          const guesser = playerManager.getPlayerById(playerId);
+          if (guesser && guesser.socketId) {
+            // Send batched or single event
+            io.to(guesser.socketId).emit('draw_move', Array.isArray(result.data) ? result.data : [result.data]);
+          }
+        }
+      });
+    }
+  });
+
+  socket.on('draw_end', (payload) => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player || !player.roomId) {
+      return;
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      return;
+    }
+
+    const result = drawingEngine.handleDrawEnd(room, player.id, payload);
+    if (result.success) {
+      // Broadcast to guessers only (not drawer)
+      const drawerId = room.game.drawerId;
+      room.players.forEach(playerId => {
+        if (playerId !== drawerId) {
+          const guesser = playerManager.getPlayerById(playerId);
+          if (guesser && guesser.socketId) {
+            io.to(guesser.socketId).emit('draw_end', result.data);
+          }
+        }
+      });
+    }
+  });
+
+  socket.on('clear_canvas', () => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player || !player.roomId) {
+      socket.emit('game_error', { error: 'Not in a room' });
+      return;
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      socket.emit('game_error', { error: 'Room not found' });
+      return;
+    }
+
+    const result = drawingEngine.handleClearCanvas(room, player.id);
+    if (result.success) {
+      // Broadcast to guessers only (not drawer)
+      const drawerId = room.game.drawerId;
+      room.players.forEach(playerId => {
+        if (playerId !== drawerId) {
+          const guesser = playerManager.getPlayerById(playerId);
+          if (guesser && guesser.socketId) {
+            io.to(guesser.socketId).emit('clear_canvas');
+          }
+        }
+      });
+    } else {
+      socket.emit('game_error', { error: result.error });
+    }
+  });
+
+  // =============================================================================
+  // GUESS HANDLERS (MODULE 9)
+  // =============================================================================
+
+  socket.on('guess', (payload) => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player) {
+      socket.emit('game_error', { error: 'Player not found' });
+      return;
+    }
+
+    if (!player.roomId) {
+      socket.emit('game_error', { error: 'Not in a room' });
+      return;
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      socket.emit('game_error', { error: 'Room not found' });
+      return;
+    }
+
+    // Validate payload
+    if (!payload || typeof payload !== 'object' || typeof payload.guess !== 'string') {
+      socket.emit('game_error', { error: 'Invalid guess format' });
+      return;
+    }
+
+    const { guess } = payload;
+    const guessTimestamp = Date.now();
+
+    // Validate guess
+    const result = guessEngine.validateGuess(room, player.id, guess);
+    if (!result.success) {
+      socket.emit('game_error', { error: result.error });
+      return;
+    }
+
+    // Broadcast guess as chat message (masked if incorrect)
+    const normalizedGuess = guessEngine.normalizeGuess(guess);
+    const maskedGuess = result.isCorrect ? normalizedGuess : '*'.repeat(normalizedGuess.length);
+    
+    broadcastToRoom(room.id, 'chat_message', {
+      playerId: player.id,
+      playerName: player.name,
+      message: maskedGuess,
+      isCorrect: result.isCorrect
+    });
+
+    if (result.isCorrect) {
+      // Award score
+      const scoreResult = scoreEngine.awardGuessScore(
+        room,
+        player.id,
+        guessTimestamp,
+        playerManager.getPlayerById,
+        playerManager.updatePlayerScore
+      );
+
+      if (scoreResult.success) {
+        // Broadcast correct guess
+        broadcastToRoom(room.id, 'correct_guess', {
+          playerId: player.id,
+          playerName: player.name,
+          word: wordEngine.getSelectedWord(room), // Reveal word
+          score: scoreResult.score,
+          totalScore: scoreResult.totalScore
+        });
+
+        // Update leaderboard
+        const leaderboard = scoreEngine.getLeaderboard(room, playerManager.getPlayerById);
+        broadcastToRoom(room.id, 'leaderboard_update', {
+          leaderboard: leaderboard
+        });
+
+        // Check if all guessers have guessed
+        if (guessEngine.allGuessersGuessed(room)) {
+          // End round early
+          endRoundForRoom(room);
+        }
+      }
+    }
+  });
+
+  // =============================================================================
+  // GAME REPLAY HANDLER (MODULE 11)
+  // =============================================================================
+
+  socket.on('play_again', () => {
+    const player = playerManager.getPlayer(socket.id);
+    if (!player) {
+      socket.emit('game_error', { error: 'Player not found' });
+      return;
+    }
+
+    if (!player.roomId) {
+      socket.emit('game_error', { error: 'Not in a room' });
+      return;
+    }
+
+    const room = roomManager.getRoom(player.roomId);
+    if (!room) {
+      socket.emit('game_error', { error: 'Room not found' });
+      return;
+    }
+
+    // Check if player is room owner
+    if (room.ownerId !== player.id) {
+      socket.emit('game_error', { error: 'Only room owner can start a new game' });
+      return;
+    }
+
+    // Check if game is finished
+    if (room.status !== gameEngine.ROOM_STATUS.FINISHED) {
+      socket.emit('game_error', { error: 'Game is not finished' });
+      return;
+    }
+
+    // Reset game state back to lobby-style "waiting" as per authority model:
+    // backend decides when a game exists, frontend only reflects state.
+    const result = gameEngine.resetGame(room);
+    if (result.success) {
+      // Reset player scores for a fresh scoreboard next time the game starts
+      playerManager.resetPlayerScores(room.players);
+
+      // Re‑serialize room so clients see updated status/scores in lobby
+      const serializedRoom = roomManager.serializeRoom(
+        room,
+        playerManager.getPlayerById
+      );
+
+      // Keep general room listeners in sync (owner, settings, status)
+      broadcastRoomUpdate(room.id);
+
+      // Notify clients that game state has been cleared and lobby is ready
+      broadcastToRoom(room.id, 'game_reset', {
+        room: serializedRoom
+      });
+    } else {
+      socket.emit('game_error', { error: result.error });
     }
   });
 

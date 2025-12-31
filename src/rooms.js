@@ -1,3 +1,15 @@
+// =============================================================================
+// ROOM LIFECYCLE MANAGEMENT MODULE
+// Real-time Multiplayer Drawing Game Backend
+// =============================================================================
+// Purpose: Manage room creation, joining, leaving, and cleanup
+// This module handles the pre-game lobby state only
+// =============================================================================
+
+// =============================================================================
+// IN-MEMORY ROOM STORAGE
+// =============================================================================
+
 // Map structure: roomId -> room object
 // We use roomId as the key for O(1) lookup
 const rooms = new Map();
@@ -21,10 +33,14 @@ const DEFAULT_SETTINGS = {
 // Validation limits
 const LIMITS = {
   maxPlayers: { min: 2, max: 12 },
-  drawTime: { min: 30, max: 180 },
-  rounds: { min: 1, max: 10 }
+  drawTime: { min: 30, max: 120 },
+  rounds: { min: 1, max: 10 },
+  customWords: { maxLength: 50, maxCount: 50 }
 };
 
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
 
 /**
  * Generate a unique room ID
@@ -111,8 +127,9 @@ function validateSettings(settings) {
   if (Array.isArray(settings.customWords)) {
     validated.customWords = settings.customWords
       .filter(word => typeof word === 'string' && word.trim().length > 0)
-      .map(word => word.trim())
-      .slice(0, 50); // Limit to 50 custom words
+      .map(word => word.trim().toLowerCase()) // Normalize to lowercase
+      .filter(word => word.length <= LIMITS.customWords.maxLength) // Enforce max word length
+      .slice(0, LIMITS.customWords.maxCount); // Limit to max count
   }
 
   return validated;
@@ -269,6 +286,56 @@ function leaveRoom(playerId, roomId) {
 }
 
 /**
+ * Update room settings (owner only, waiting state only)
+ * @param {string} playerId - ID of player updating settings
+ * @param {string} roomId - Room ID to update
+ * @param {Object} newSettings - New settings from client
+ * @returns {Object} { success: boolean, settings: Object|null, error: string|null }
+ */
+function updateRoomSettings(playerId, roomId, newSettings) {
+  // Normalize room ID
+  const normalizedRoomId = normalizeRoomId(roomId);
+
+  // Check if room exists
+  const room = rooms.get(normalizedRoomId);
+  if (!room) {
+    return { success: false, settings: null, error: 'Room not found' };
+  }
+
+  // Check if player is the room owner
+  if (room.ownerId !== playerId) {
+    console.log(`[ROOM] Settings update rejected: ${playerId} is not owner of ${normalizedRoomId}`);
+    return { success: false, settings: null, error: 'Only room owner can update settings' };
+  }
+
+  // Check if room is in waiting state (settings locked once game starts)
+  if (room.status !== 'waiting') {
+    console.log(`[ROOM] Settings update rejected: ${normalizedRoomId} is not in waiting state`);
+    return { success: false, settings: null, error: 'Settings locked: game has started' };
+  }
+
+  // Validate new settings
+  const validatedSettings = validateSettings(newSettings);
+
+  // Special validation: maxPlayers cannot be less than current player count
+  if (validatedSettings.maxPlayers < room.players.length) {
+    console.log(`[ROOM] Settings update rejected: maxPlayers (${validatedSettings.maxPlayers}) < current players (${room.players.length})`);
+    return { 
+      success: false, 
+      settings: null, 
+      error: `Cannot set max players below current player count (${room.players.length})` 
+    };
+  }
+
+  // Update room settings
+  room.settings = validatedSettings;
+
+  console.log(`[ROOM] Settings updated: ${normalizedRoomId} | Owner: ${playerId} | Settings: ${JSON.stringify(validatedSettings)}`);
+
+  return { success: true, settings: validatedSettings, error: null };
+}
+
+/**
  * Get room by ID
  * @param {string} roomId - Room ID to lookup
  * @returns {Object|null} Room object or null if not found
@@ -318,6 +385,7 @@ module.exports = {
   createRoom,
   joinRoom,
   leaveRoom,
+  updateRoomSettings,
   getRoom,
   getRoomByPlayer,
   getAllRooms,

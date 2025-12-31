@@ -89,7 +89,8 @@ function createPlayer(socketId) {
     id: playerId,
     socketId: socketId,
     name: generateDefaultName(),
-    roomId: null // Will be used by room management module
+    roomId: null, // Will be used by room management module
+    score: 0 // Initial score for scoring system
   };
 
   // Store player in memory using socketId as key
@@ -156,6 +157,41 @@ function updatePlayerRoom(playerId, roomId) {
   }
 
   return true;
+}
+
+/**
+ * Update player's score
+ * Called by scoring system to update player's total score
+ * @param {string} playerId - Player ID to update
+ * @param {number} newScore - New total score
+ * @returns {boolean} True if updated successfully
+ */
+function updatePlayerScore(playerId, newScore) {
+  const player = playerById.get(playerId);
+  if (!player) {
+    return false;
+  }
+
+  if (typeof newScore !== 'number' || newScore < 0) {
+    return false;
+  }
+
+  player.score = newScore;
+  return true;
+}
+
+/**
+ * Reset player scores for all players in a room
+ * Called when starting a new game (play again)
+ * @param {Array} playerIds - Array of player IDs to reset
+ */
+function resetPlayerScores(playerIds) {
+  playerIds.forEach(playerId => {
+    const player = playerById.get(playerId);
+    if (player) {
+      player.score = 0;
+    }
+  });
 }
 
 /**
@@ -227,6 +263,8 @@ module.exports = {
   createPlayer,
   updatePlayerName,
   updatePlayerRoom,
+  updatePlayerScore,
+  resetPlayerScores,
   removePlayer,
   getPlayer,
   getPlayerById,
