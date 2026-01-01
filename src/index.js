@@ -448,6 +448,7 @@ io.on('connection', (socket) => {
         )}`
       );
       io.to(drawer.socketId).emit('word_options', {
+        game: serializeGameState(room),
         options: wordOptionsResult.options,
         timeout: wordEngine.WORD_SELECTION_TIMEOUT
       });
@@ -477,8 +478,9 @@ io.on('connection', (socket) => {
 
         const autoSelectResult = wordEngine.autoSelectWord(room);
         if (autoSelectResult.success) {
-          // Broadcast word selected
+          // Broadcast word selected (include game state so frontend can update drawer)
           broadcastToRoom(roomId, 'word_selected', {
+            game: serializeGameState(room),
             maskedWord: autoSelectResult.maskedWord,
             autoSelected: true
           });
@@ -529,8 +531,9 @@ io.on('connection', (socket) => {
       console.log(
         `[WORD] Emitting word_selected | room=${room.id} | maskedWord=${result.maskedWord}`
       );
-      // Broadcast word selected to room
+      // Broadcast word selected to room (include game state so frontend can update drawer)
       broadcastToRoom(room.id, 'word_selected', {
+        game: serializeGameState(room),
         maskedWord: result.maskedWord,
         autoSelected: false
       });
@@ -581,10 +584,51 @@ io.on('connection', (socket) => {
       }
     });
   
-    // Start drawing timer
+    // Initialize hint level for progressive hints (reset for new round)
+    room.game.hintLevel = 0;
+    
+    // Start drawing timer with progressive hints
+    const drawTime = room.settings.drawTime;
+    const selectedWord = wordEngine.getSelectedWord(room);
+    const wordLength = selectedWord ? selectedWord.replace(/\s/g, '').length : 5;
+    
+    // Calculate hint reveal: max 30-40% of letters, reveal every 15 seconds
+    const maxHints = Math.max(1, Math.floor(wordLength * 0.35)); // Max 35% of letters
+    const hintInterval = 15; // Fixed 15 second intervals
+    const maxHintTime = maxHints * hintInterval; // Total time for all hints
+    
     timerEngine.startDrawingTimer(
       room,
       (roomId, remaining) => {
+        // Calculate hint level based on elapsed time
+        const elapsed = drawTime - remaining;
+        
+        // Only reveal hints if within the hint reveal window
+        if (elapsed <= maxHintTime) {
+          const newHintLevel = Math.min(
+            Math.floor(elapsed / hintInterval) + 1,
+            maxHints
+          );
+          
+          // Update hint if level changed and hints are enabled
+          if (newHintLevel > room.game.hintLevel && room.settings.hints) {
+            room.game.hintLevel = newHintLevel;
+            const hintWord = wordEngine.generateHint(selectedWord, newHintLevel);
+            
+            // Broadcast hint update to guessers only
+            room.players.forEach(playerId => {
+              if (playerId !== drawerId) {
+                const player = playerManager.getPlayerById(playerId);
+                if (player && player.socketId) {
+                  io.to(player.socketId).emit('hint_update', {
+                    hintWord: hintWord
+                  });
+                }
+              }
+            });
+          }
+        }
+        
         broadcastToRoom(roomId, 'timer_tick', {
           remaining: remaining,
           type: 'drawing'
@@ -867,16 +911,21 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Broadcast guess as chat message (masked if incorrect)
+    // Broadcast guess as chat message
+    // If correct: will be replaced by correct_guess event
+    // If incorrect: show as regular chat message (unmasked)
     const normalizedGuess = guessEngine.normalizeGuess(guess);
-    const maskedGuess = result.isCorrect ? normalizedGuess : '*'.repeat(normalizedGuess.length);
     
-    broadcastToRoom(room.id, 'chat_message', {
-      playerId: player.id,
-      playerName: player.name,
-      message: maskedGuess,
-      isCorrect: result.isCorrect
-    });
+    if (!result.isCorrect) {
+      // Show incorrect guesses as regular chat messages (unmasked)
+      broadcastToRoom(room.id, 'chat_message', {
+        playerId: player.id,
+        playerName: player.name,
+        message: normalizedGuess,
+        isCorrect: false
+      });
+    }
+    // Correct guesses are handled below and will show "✔️ guessed the word!"
 
     if (result.isCorrect) {
       // Award score

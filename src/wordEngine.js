@@ -112,6 +112,101 @@ function maskWord(word) {
 }
 
 /**
+ * Generate progressive hint for word
+ * Reveals letters progressively: start with one letter, leave 3 blanks, reveal next
+ * Pattern: reveal at positions 2, 6, 10... (every 4th position starting from 2)
+ * Then positions 3, 7, 11..., then 1, 5, 9..., then 0, 4, 8...
+ * @param {string} word - Word to generate hint for
+ * @param {number} hintLevel - Current hint level (0 = all masked, higher = more revealed)
+ * @returns {string} Hint word with progressively revealed letters
+ */
+function generateHint(word, hintLevel = 0) {
+  if (!word || typeof word !== 'string') {
+    return '';
+  }
+  
+  // Remove spaces for hint calculation
+  const wordWithoutSpaces = word.replace(/\s/g, '');
+  const wordLength = wordWithoutSpaces.length;
+  
+  if (wordLength === 0) {
+    return '';
+  }
+  
+  // Reveal pattern: start with position 2 (3rd letter), then every 4th position
+  // Level 1: reveal position 2
+  // Level 2: reveal positions 2, 6
+  // Level 3: reveal positions 2, 6, 10
+  // Level 4: reveal positions 2, 6, 10, 14
+  // Level 5: also reveal position 3 (next in sequence)
+  // etc.
+  
+  const revealedPositions = new Set();
+  
+  if (hintLevel > 0) {
+    // Calculate positions to reveal based on hint level
+    // Start revealing from position 2, then every 4th position
+    let positionsToReveal = [];
+    
+    // First round: positions 2, 6, 10, 14... (every 4th starting from 2)
+    for (let i = 2; i < wordLength; i += 4) {
+      positionsToReveal.push(i);
+    }
+    
+    // Second round: positions 3, 7, 11, 15... (every 4th starting from 3)
+    for (let i = 3; i < wordLength; i += 4) {
+      positionsToReveal.push(i);
+    }
+    
+    // Third round: positions 1, 5, 9, 13... (every 4th starting from 1)
+    for (let i = 1; i < wordLength; i += 4) {
+      positionsToReveal.push(i);
+    }
+    
+    // Fourth round: positions 0, 4, 8, 12... (every 4th starting from 0)
+    for (let i = 0; i < wordLength; i += 4) {
+      positionsToReveal.push(i);
+    }
+    
+    // Reveal up to hintLevel positions
+    for (let i = 0; i < hintLevel && i < positionsToReveal.length; i++) {
+      revealedPositions.add(positionsToReveal[i]);
+    }
+  }
+  
+  // Build the hint string with spaces between characters
+  let result = '';
+  let charIndex = 0;
+  
+  for (let i = 0; i < word.length; i++) {
+    const char = word[i];
+    if (char === ' ') {
+      result += ' ';
+    } else {
+      if (revealedPositions.has(charIndex)) {
+        result += char;
+      } else {
+        result += '_';
+      }
+      charIndex++;
+      // Add space between characters for display (except last char)
+      if (i < word.length - 1) {
+        const nextChar = word[i + 1];
+        if (nextChar !== ' ') {
+          result += ' ';
+        }
+      }
+    }
+    // Handle spaces in original word
+    if (char === ' ' && i < word.length - 1) {
+      result += ' ';
+    }
+  }
+  
+  return result;
+}
+
+/**
  * Normalize word for comparison (lowercase, trim)
  * @param {string} word - Word to normalize
  * @returns {string} Normalized word
@@ -308,6 +403,7 @@ module.exports = {
   // Utilities
   maskWord,
   normalizeWord,
+  generateHint,
   
   // Constants
   WORD_SELECTION_TIMEOUT
